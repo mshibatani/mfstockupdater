@@ -24,7 +24,6 @@ import email.utils # 追加
 class MoneyForward:
     def __init__(self) -> None:
         self.stock_price_cache: dict[str, float] = dict()
-        # self.stock_price_cache['AAPL'] = 188.38 # for DEBUG 
 
     def init(self):
         logger.info("selenium initializing...")
@@ -182,8 +181,14 @@ class MoneyForward:
         # --- グループ選択処理 (ここまで) ---
 
     def portfolio(self):
-        # usdrate = 146.935 # for DEBUG
-        usdrate = self.usdrate()
+        try:
+            usdrate = self.usdrate()
+        except Exception as e:
+            logger.warning(f"Warning fetching USD/JPY rate: {type(e).__name__} - {e}")
+            usdrate = 123.456 # for DEBUG  
+            self.stock_price_cache['AAPL'] = 188.38 # for DEBUG 
+            self.stock_price_cache['ACWI'] = 108.64 # for DEBUG 
+
         logger.info("USDJPY: " + str(usdrate))
         try: # ★追加: ページ読み込みと待機処理をtryで囲む
             logger.debug("Navigating to portfolio page...") # ★追加: デバッグログ
@@ -211,15 +216,17 @@ class MoneyForward:
         for i in range(len(elements)):
             tds = elements[i].find_elements(by=By.TAG_NAME, value="td")
             name = tds[1].text
+            #logger.info(f"elements at {i}: {name}")
             if name[0:1] == "#":
                 entry = name.split("-")
                 stock_price = self.stock_price(entry[1])
                 stock_count = int(entry[2])
                 logger.info(entry[0] + ": " + entry[1] + " is " + str(stock_price) + "USD (" + str(int(usdrate * stock_price)) + " JPY) x " + str(stock_count))
                 img = tds[11].find_element(by=By.TAG_NAME, value="img")
+                time.sleep(3)
                 self.driver.execute_script("arguments[0].click();", img)
                 det_value = tds[11].find_element(by=By.ID, value="user_asset_det_value")
-                for i in range(1, 3):
+                for t in range(1, 3):
                     time.sleep(3) # 時々エラーになるので長めに待つ
                     try:
                         self.send_to_element_direct(det_value, str(int(usdrate * stock_price) * stock_count))
@@ -227,12 +234,18 @@ class MoneyForward:
                         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
                         error_filename_base = f"error_at_send_to_element_direct{timestamp}"
                         #self.driver.save_screenshot(f"{error_filename_base}.png")
-                        logger.warning(f"Warning at a trial {i} send_to_element_direct {error_filename_base}.png")
-                    else:
-                        break
+                        logger.warning(f"Warning at a trial {t} send_to_element_direct {error_filename_base}.png")
                     #self.send_to_element_direct(det_value, str(int(usdrate * stock_price) * stock_count))
                 commit = tds[11].find_element(by=By.NAME, value="commit")
-                commit.click()
+                for t in range(1, 3):
+                    time.sleep(3) # 時々エラーになるので長めに待
+                    try:
+                        commit.click()
+                    except Exception as save_err:
+                        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                        error_filename_base = f"error_at_commit{timestamp}"
+                        #self.driver.save_screenshot(f"{error_filename_base}.png")
+                        logger.warning(f"Warning at a trial {t} commit {error_filename_base}.png")
                 time.sleep(1)
                 logger.info(entry[0] + " is updated.")
                 elements = self.driver.find_elements(by=By.XPATH, value='//*[@id="portfolio_det_eq"]/table/tbody/tr')  # avoid stale error
