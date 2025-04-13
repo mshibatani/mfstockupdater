@@ -186,8 +186,8 @@ class MoneyForward:
         except Exception as e:
             logger.warning(f"Warning fetching USD/JPY rate: {type(e).__name__} - {e}")
             usdrate = 123.456 # for DEBUG  
-            self.stock_price_cache['AAPL'] = 188.38 # for DEBUG 
-            self.stock_price_cache['ACWI'] = 108.64 # for DEBUG 
+            self.stock_price_cache['AAPL'] = 154.32 # for DEBUG 
+            self.stock_price_cache['ACWI'] = 123.45 # for DEBUG 
 
         logger.info("USDJPY: " + str(usdrate))
         try: # ★追加: ページ読み込みと待機処理をtryで囲む
@@ -217,38 +217,105 @@ class MoneyForward:
             tds = elements[i].find_elements(by=By.TAG_NAME, value="td")
             name = tds[1].text
             #logger.info(f"elements at {i}: {name}")
-            if name[0:1] == "#":
+            if name.startswith("#"): # ★ name[0:1] == "#" を変更
                 entry = name.split("-")
+                if len(entry) < 3:
+                     logger.warning(f"Invalid format in name '{name}'. Skipping.")
+                     continue
                 stock_price = self.stock_price(entry[1])
-                stock_count = int(entry[2])
-                logger.info(entry[0] + ": " + entry[1] + " is " + str(stock_price) + "USD (" + str(int(usdrate * stock_price)) + " JPY) x " + str(stock_count))
-                img = tds[11].find_element(by=By.TAG_NAME, value="img")
-                time.sleep(3)
-                self.driver.execute_script("arguments[0].click();", img)
-                det_value = tds[11].find_element(by=By.ID, value="user_asset_det_value")
-                for t in range(1, 3):
-                    time.sleep(3) # 時々エラーになるので長めに待つ
-                    try:
-                        self.send_to_element_direct(det_value, str(int(usdrate * stock_price) * stock_count))
-                    except Exception as save_err:
-                        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                        error_filename_base = f"error_at_send_to_element_direct{timestamp}"
-                        #self.driver.save_screenshot(f"{error_filename_base}.png")
-                        logger.warning(f"Warning at a trial {t} send_to_element_direct {error_filename_base}.png")
-                    #self.send_to_element_direct(det_value, str(int(usdrate * stock_price) * stock_count))
-                commit = tds[11].find_element(by=By.NAME, value="commit")
-                for t in range(1, 3):
-                    time.sleep(3) # 時々エラーになるので長めに待
-                    try:
-                        commit.click()
-                    except Exception as save_err:
-                        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-                        error_filename_base = f"error_at_commit{timestamp}"
-                        #self.driver.save_screenshot(f"{error_filename_base}.png")
-                        logger.warning(f"Warning at a trial {t} commit {error_filename_base}.png")
-                time.sleep(1)
-                logger.info(entry[0] + " is updated.")
-                elements = self.driver.find_elements(by=By.XPATH, value='//*[@id="portfolio_det_eq"]/table/tbody/tr')  # avoid stale error
+                if stock_price is None:
+                    logger.warning(f"Could not get stock price for {entry[1]}. Skipping update for {name}.")
+                    continue
+                try: # stock_count の変換エラーも考慮
+                    stock_count = float(entry[2])
+                except ValueError:
+                    logger.warning(f"Invalid stock count format for {name}: {entry[2]}. Skipping.")
+                    continue
+
+                logger.info(f"{entry[0]}: {entry[1]} is {stock_price} USD ({int(usdrate * stock_price)} JPY) x {stock_count}") # ★ f-string に変更
+
+                try:
+                    # --- 要素操作開始 ---
+                    img = tds[11].find_element(by=By.TAG_NAME, value="img")
+                    self.driver.execute_script("arguments[0].click();", img) # 画像をクリック
+
+                    det_value_id = "user_asset_det_value"
+                    commit_name = "commit"
+
+                    # ★修正点1: 入力欄が表示され、クリック可能になるまで待機！
+                    det_value = self.wait.until(
+                        ec.element_to_be_clickable((By.ID, det_value_id))
+                    )
+                    logger.debug(f"Element {det_value_id} is clickable for {name}")
+
+                    # ★修正点2: 送信処理のリトライ（time.sleep削除）
+                    send_success = False
+                    for retry_count in range(2): # 2回試行
+                        try:
+                            self.send_to_element_direct(det_value, str(int(usdrate * stock_price) * stock_count))
+                            send_success = True
+                            logger.debug(f"Attempt {retry_count + 1}: send_keys successful for {name}")
+                            break # 成功！
+                        except StaleElementReferenceException: # 要素が古くなった場合
+                             logger.warning(f"Attempt {retry_count + 1}: Stale element for det_value. Re-finding.")
+                             try: # 要素を再検索して待機
+                                 det_value = self.wait.until(ec.element_to_be_clickable((By.ID, det_value_id)))
+                             except Exception as find_err:
+                                 logger.error(f"Failed to re-find clickable det_value: {find_err}")
+                                 break # 再検索失敗なら諦める
+                        except Exception as send_err: # その他の送信エラー (ElementNotInteractableも含む)
+                            logger.warning(f"Attempt {retry_count + 1} send_keys failed: {send_err}")
+                            if retry_count < 1: time.sleep(1) # 少し待ってリトライ
+
+                    if not send_success:
+                        logger.error(f"Failed to send keys for {name}. Skipping commit.")
+                        continue # 送信失敗なら次へ
+
+                    # ★修正点3: コミットボタンもクリック可能になるまで待機！
+                    commit = self.wait.until(
+                        ec.element_to_be_clickable((By.NAME, commit_name))
+                    )
+                    logger.debug(f"Element {commit_name} is clickable for {name}")
+
+                    # ★修正点4: クリック処理のリトライ（time.sleep削除）
+                    click_success = False
+                    for retry_count in range(2): # 2回試行
+                        try:
+                            commit.click()
+                            click_success = True
+                            logger.debug(f"Attempt {retry_count + 1}: commit click successful for {name}")
+                            break # 成功！
+                        except StaleElementReferenceException:
+                             logger.warning(f"Attempt {retry_count + 1}: Stale element for commit. Re-finding.")
+                             try:
+                                 commit = self.wait.until(ec.element_to_be_clickable((By.NAME, commit_name)))
+                             except Exception as find_err:
+                                 logger.error(f"Failed to re-find clickable commit: {find_err}")
+                                 break
+                        except Exception as click_err:
+                            logger.warning(f"Attempt {retry_count + 1} commit click failed: {click_err}")
+                            if retry_count < 1: time.sleep(1)
+
+                    if click_success:
+                        time.sleep(1) # 更新反映を少し待つ
+                        logger.info(f"{entry[0]} is updated.")
+                    else:
+                        logger.error(f"Failed to click commit for {name}.")
+                    # --- 要素操作終了 ---
+
+                except (NoSuchElementException, TimeoutException) as el_err:
+                     logger.error(f"Could not find or wait for element for {name}: {el_err}. Skipping update.")
+                     continue # 要素が見つからない/待機タイムアウトなら次へ
+                except StaleElementReferenceException as stale_err:
+                    logger.warning(f"Stale element encountered during update process for {name}: {stale_err}. Skipping update.")
+                    continue # 処理中に要素が古くなったら次へ
+                except Exception as e:
+                     logger.error(f"Unexpected error during update for {name}: {e}", exc_info=True)
+                     continue # 予期せぬエラーでも次へ
+
+
+            # ループの最後での要素再取得は不要 (ループ先頭で取得しているため)
+            # elements = self.driver.find_elements(by=By.XPATH, value='//*[@id="portfolio_det_eq"]/table/tbody/tr')
 
     def stock_price(self, tick):
         # Check cache first
@@ -489,8 +556,8 @@ if __name__ == "__main__":
     try:
         mf.init()
         mf.login()
-        mf.choseGroup("グループ選択なし")
+        #mf.choseGroup("グループ選択なし")
         mf.portfolio()
     finally:
-        mf.choseGroup("生活用")
+        #mf.choseGroup("生活用")
         mf.close()
