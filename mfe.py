@@ -9,7 +9,8 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as ec
 from selenium.common.exceptions import NoSuchElementException, TimeoutException
-from selenium.webdriver.common.keys import Keys # Import Keys
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import Select
 
 import requests
 import argparse
@@ -814,10 +815,10 @@ if __name__ == "__main__":
         # Create editor instance once
         editor = MoneyForwardEditor()
         editor.init_selenium()
+
+        editor.login() # Login once
         currentGroup = editor.getCurrentGroup()
         editor.choseGroup("グループ選択なし")
-        editor.login() # Login once
-
         # Iterate through the date range
         current_date = start_date_obj
         while current_date <= end_date_obj:
