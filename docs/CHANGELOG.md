@@ -44,7 +44,7 @@ LaunchAgent が実行されなかった 2026年2月〜6月27日分を手動実�
 /opt/anaconda3/bin/python /usr/local/bin/mfe.py --start-date 2026-02-01 --end-date 2026-06-27
 ```
 
-- 対象資産: `#ETRADE-AAPL-5561`、`#FT-ACWI-304.68825`
+- 対象資産: 登録済み `#` 形式の全資産
 - 結果: スキップ・エラーなし、全件正常処理
 
 ---
