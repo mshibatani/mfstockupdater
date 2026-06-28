@@ -83,6 +83,10 @@ class MoneyForwardEditor:
             raise ValueError("env MF_ID and/or MF_PASS are not found.")
         self.mf_id = os.environ["MF_ID"]
         self.mf_pass = os.environ["MF_PASS"]
+        # 株価取得ソース: "alphavantage"（デフォルト）または "yfinance"
+        # 環境変数 STOCK_PRICE_SOURCE で切り替え可能
+        self.stock_price_source = os.getenv("STOCK_PRICE_SOURCE", "yfinance").lower()
+        logger.info(f"Stock price source: {self.stock_price_source}")
     # Keep init_selenium, login, 2FA handlers, data fetching methods as they are
 
 
@@ -523,6 +527,85 @@ class MoneyForwardEditor:
             return None
 
 
+    def get_tickers_from_page(self, date: datetime.date) -> list[str]:
+        """指定日の履歴ページから #形式の資産のティッカーを収集して返す。"""
+        date_str = date.strftime('%Y-%m-%d')
+        self.driver.get(f"https://moneyforward.com/bs/history/list/{date_str}")
+        tickers = []
+        try:
+            rows_xpath = "//tr[td[1][starts-with(normalize-space(.), '#')]]"
+            WebDriverWait(self.driver, 60).until(ec.presence_of_element_located((By.XPATH, rows_xpath)))
+            for row in self.driver.find_elements(By.XPATH, rows_xpath):
+                try:
+                    asset_name = row.find_element(By.XPATH, "./td[1]").text
+                    if asset_name.startswith("#"):
+                        parts = asset_name.split("-")
+                        if len(parts) == 3:
+                            tickers.append(parts[1])
+                except Exception:
+                    pass
+        except TimeoutException:
+            logger.warning(f"Could not load history page for {date_str} to collect tickers.")
+        return list(set(tickers))
+
+    def prefetch_stock_prices(self, tickers: list[str], start_date: datetime.date, end_date: datetime.date):
+        """全銘柄・全期間の株価を一括取得してキャッシュに保存する。
+        STOCK_PRICE_SOURCE に応じてソースを選択。yfinance使用時は失敗時にAlpha Vantageへフォールバック。"""
+        if self.stock_price_source == "yfinance":
+            self._prefetch_stock_prices_yfinance(tickers, start_date, end_date)
+        else:
+            self._prefetch_stock_prices_alphavantage(tickers, start_date, end_date)
+
+    def _prefetch_stock_prices_yfinance(self, tickers: list[str], start_date: datetime.date, end_date: datetime.date):
+        """yfinanceで全期間の株価を一括取得してキャッシュに保存する。失敗時はAlpha Vantageにフォールバック。"""
+        start_str = start_date.strftime('%Y-%m-%d')
+        fetch_end_str = (end_date + datetime.timedelta(days=1)).strftime('%Y-%m-%d')
+        fallback_tickers = []
+        for ticker in tickers:
+            logger.info(f"Prefetching {ticker} from {start_str} to {end_date.strftime('%Y-%m-%d')} via yfinance...")
+            try:
+                hist = yf.Ticker(ticker).history(start=start_str, end=fetch_end_str)
+                if hist.empty:
+                    logger.warning(f"No yfinance data for {ticker}. Falling back to Alpha Vantage.")
+                    fallback_tickers.append(ticker)
+                    continue
+                for ts, row in hist.iterrows():
+                    cache_key = f"{ticker}_{ts.strftime('%Y-%m-%d')}_yf"
+                    self.stock_price_cache[cache_key] = float(row['Close'])
+                logger.info(f"Cached {len(hist)} days of prices for {ticker} via yfinance.")
+            except Exception as e:
+                logger.warning(f"yfinance failed for {ticker}: {e}. Falling back to Alpha Vantage.")
+                fallback_tickers.append(ticker)
+        if fallback_tickers:
+            self._prefetch_stock_prices_alphavantage(fallback_tickers, start_date, end_date)
+
+    def _prefetch_stock_prices_alphavantage(self, tickers: list[str], start_date: datetime.date, end_date: datetime.date):
+        """Alpha Vantage TIME_SERIES_DAILY(outputsize=full)で全期間の株価を一括取得してキャッシュに保存する。"""
+        for ticker in tickers:
+            logger.info(f"Prefetching {ticker} via Alpha Vantage (1 API call, full history)...")
+            try:
+                url = (f"https://www.alphavantage.co/query?function=TIME_SERIES_DAILY"
+                       f"&symbol={ticker}&apikey={self.alphavantage_apikey}&outputsize=compact")
+                r = requests.get(url, timeout=30)
+                r.raise_for_status()
+                data = r.json()
+                if "Time Series (Daily)" not in data:
+                    logger.error(f"Alpha Vantage: unexpected response for {ticker}: {data}")
+                    continue
+                count = 0
+                for date_str, values in data["Time Series (Daily)"].items():
+                    try:
+                        date_obj = datetime.datetime.strptime(date_str, '%Y-%m-%d').date()
+                    except ValueError:
+                        continue
+                    if start_date <= date_obj <= end_date:
+                        cache_key = f"{ticker}_{date_str}_yf"
+                        self.stock_price_cache[cache_key] = float(values["4. close"])
+                        count += 1
+                logger.info(f"Alpha Vantage: cached {count} days of prices for {ticker}.")
+            except Exception as e:
+                logger.error(f"Error prefetching {ticker} via Alpha Vantage: {e}")
+
     # Modify edit_history to accept the target date
     def edit_history(self, target_date: datetime.date):
         """Navigates to the history page for the given date and edits assets."""
@@ -581,8 +664,11 @@ class MoneyForwardEditor:
                             continue # Skip to next row
 
                         # Get historical data for the specific target_date_str
-                        # Use the new yfinance function
-                        hist_stock_price = self.get_historical_stock_price_yf(ticker, target_date_str)
+                        # ソースはprefetchと同じ（通常はキャッシュヒットするため直接呼ばれない）
+                        if self.stock_price_source == "yfinance":
+                            hist_stock_price = self.get_historical_stock_price_yf(ticker, target_date_str)
+                        else:
+                            hist_stock_price = self.get_historical_stock_price(ticker, target_date_str)
                         hist_exchange_rate = self.get_historical_exchange_rate(target_date_str)
 
                         calculated_value = None
@@ -819,6 +905,15 @@ if __name__ == "__main__":
         editor.login() # Login once
         currentGroup = editor.getCurrentGroup()
         editor.choseGroup("グループ選択なし")
+
+        # 全銘柄・全期間の株価を処理開始前に一括取得（yfinance APIコールを最小化）
+        tickers = editor.get_tickers_from_page(start_date_obj)
+        if tickers:
+            logger.info(f"Found tickers to prefetch: {tickers}")
+            editor.prefetch_stock_prices(tickers, start_date_obj, end_date_obj)
+        else:
+            logger.warning("No tickers found for prefetch. Will fetch per-day as fallback.")
+
         # Iterate through the date range
         current_date = start_date_obj
         while current_date <= end_date_obj:
